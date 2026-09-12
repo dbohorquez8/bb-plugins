@@ -1,7 +1,10 @@
 import { execFile } from 'node:child_process';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import { z } from 'zod';
-import { CREATE_OUTCOME_UNCERTAIN_MARKER } from '../contract.js';
+import {
+  CREATE_OUTCOME_UNCERTAIN_MARKER,
+  type WorkStateCategory
+} from '../contract.js';
 import type {
   ExternalWorkItemCreateInput,
   ExternalWorkItemDetail,
@@ -24,11 +27,11 @@ const githubItemSchema = z
     body: z.string(),
     updatedAt: z.string()
   })
-  .strict();
+  .passthrough();
 
 const listOutputSchema = z
   .object({ items: z.array(githubItemSchema) })
-  .strict();
+  .passthrough();
 
 const detailOutputSchema = z
   .object({
@@ -45,9 +48,9 @@ const detailOutputSchema = z
             .strict()
         )
       })
-      .strict()
+      .passthrough()
   })
-  .strict();
+  .passthrough();
 
 export const githubStatusOutputSchema = z
   .object({
@@ -58,14 +61,14 @@ export const githubStatusOutputSchema = z
     ),
     lastSyncedAt: z.string().nullable()
   })
-  .strict();
+  .passthrough();
 
 const refreshOutputSchema = z
   .object({
     repos: z.number().int().nonnegative(),
     items: z.number().int().nonnegative()
   })
-  .strict();
+  .passthrough();
 
 const okOutputSchema = z.object({ ok: z.literal(true) }).strict();
 
@@ -239,11 +242,260 @@ export function githubReposForProject(
   ];
 }
 
+// ---- GitHub Projects (v2) status enrichment ----
+// BB's builtin github plugin only syncs issue open/closed. To surface real
+// board columns (Backlog / Ready / In progress / …) we read each issue's
+// Project v2 Status field directly via the gh CLI and map it onto the item.
+const projectStatusItemSchema = z
+  .object({
+    content: z
+      .object({
+        type: z.string().optional(),
+        number: z.number().int().optional(),
+        repository: z.string().optional()
+      })
+      .passthrough()
+      .optional(),
+    repository: z.string().optional(),
+    status: z.string().optional(),
+    priority: z.string().optional()
+  })
+  .passthrough();
+
+const projectItemListSchema = z
+  .object({ items: z.array(projectStatusItemSchema) })
+  .passthrough();
+
+const projectListEntrySchema = z
+  .object({ number: z.number().int() })
+  .passthrough();
+
+const projectListSchema = z
+  .object({ projects: z.array(projectListEntrySchema) })
+  .passthrough();
+
+interface ProjectStatus {
+  status: string;
+  priority: string | null;
+}
+
+function projectStateCategory(name: string): WorkStateCategory | null {
+  const value = name.trim().toLowerCase();
+  if (!value) return null;
+  if (/\b(backlog|icebox|triage)\b/u.test(value)) return 'backlog';
+  if (/\b(ready|to ?do|up next|planned|new|open|selected)\b/u.test(value)) {
+    return 'todo';
+  }
+  if (
+    /\b(in ?progress|in ?review|doing|started|active|building|qa|review)\b/u.test(
+      value
+    )
+  ) {
+    return 'in_progress';
+  }
+  if (
+    /\b(done|shipped|closed|complete|completed|merged|released)\b/u.test(value)
+  ) {
+    return 'done';
+  }
+  if (
+    /\b(cancell?ed|wont ?do|won.?t ?do|dropped|abandoned|duplicate|invalid)\b/u.test(
+      value
+    )
+  ) {
+    return 'canceled';
+  }
+  return null;
+}
+
+// One map covering every issue on any of the owner's project boards, keyed by
+// "owner/repo#number". Best-effort: any gh failure degrades to open/closed.
+async function loadProjectStatusMap(
+  runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
+  repos: readonly string[]
+): Promise<Map<string, ProjectStatus>> {
+  const map = new Map<string, ProjectStatus>();
+  const repoSet = new Set(repos);
+  const owners = [
+    ...new Set(repos.map(repo => repo.split('/')[0]).filter(Boolean))
+  ];
+  for (const owner of owners) {
+    let projectNumbers: number[] = [];
+    try {
+      const listOut = await runGithubCli(
+        [
+          'project',
+          'list',
+          '--owner',
+          owner,
+          '--limit',
+          '100',
+          '--format',
+          'json'
+        ],
+        20_000
+      );
+      projectNumbers = projectListSchema
+        .parse(JSON.parse(listOut))
+        .projects.map(project => project.number);
+    } catch {
+      continue;
+    }
+    for (const number of projectNumbers) {
+      let items: z.infer<typeof projectStatusItemSchema>[] = [];
+      try {
+        const itemsOut = await runGithubCli(
+          [
+            'project',
+            'item-list',
+            String(number),
+            '--owner',
+            owner,
+            '--limit',
+            '2000',
+            '--format',
+            'json'
+          ],
+          30_000
+        );
+        items = projectItemListSchema.parse(JSON.parse(itemsOut)).items;
+      } catch {
+        continue;
+      }
+      for (const item of items) {
+        const status = item.status?.trim();
+        if (!status) continue;
+        const repo = item.content?.repository ?? item.repository;
+        const num = item.content?.number;
+        if (!repo || typeof num !== 'number' || !repoSet.has(repo)) continue;
+        const key = `${repo}#${num}`;
+        if (map.has(key)) continue;
+        map.set(key, { status, priority: item.priority?.trim() || null });
+      }
+    }
+  }
+  return map;
+}
+
+// Status field option metadata from a Project v2 board.
+const projectFieldSchema = z
+  .object({
+    name: z.string().optional(),
+    type: z.string().optional(),
+    options: z.array(z.object({ name: z.string() }).passthrough()).optional()
+  })
+  .passthrough();
+
+const projectFieldListSchema = z
+  .object({ fields: z.array(projectFieldSchema) })
+  .passthrough();
+
+interface ProjectStatusOption {
+  name: string;
+  category: WorkStateCategory;
+}
+
+// gh project calls are slow and the Kanban preloads statuses for every visible
+// item at once, so cache per owner for a short window to collapse the fan-out.
+const STATUS_CACHE_TTL_MS = 60_000;
+const statusMapCache = new Map<
+  string,
+  { expires: number; value: Promise<Map<string, ProjectStatus>> }
+>();
+const statusOptionsCache = new Map<
+  string,
+  { expires: number; value: Promise<ProjectStatusOption[]> }
+>();
+
+function getProjectStatusMap(
+  runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
+  repos: readonly string[]
+): Promise<Map<string, ProjectStatus>> {
+  const key = [...new Set(repos)].sort().join(',');
+  const now = Date.now();
+  const cached = statusMapCache.get(key);
+  if (cached && cached.expires > now) return cached.value;
+  const value = loadProjectStatusMap(runGithubCli, repos);
+  statusMapCache.set(key, { expires: now + STATUS_CACHE_TTL_MS, value });
+  return value;
+}
+
+async function loadProjectStatusOptions(
+  runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
+  owner: string
+): Promise<ProjectStatusOption[]> {
+  const options: ProjectStatusOption[] = [];
+  const seen = new Set<string>();
+  let projectNumbers: number[] = [];
+  try {
+    const listOut = await runGithubCli(
+      ['project', 'list', '--owner', owner, '--limit', '100', '--format', 'json'],
+      20_000
+    );
+    projectNumbers = projectListSchema
+      .parse(JSON.parse(listOut))
+      .projects.map(project => project.number);
+  } catch {
+    return options;
+  }
+  for (const number of projectNumbers) {
+    try {
+      const fieldsOut = await runGithubCli(
+        [
+          'project',
+          'field-list',
+          String(number),
+          '--owner',
+          owner,
+          '--limit',
+          '100',
+          '--format',
+          'json'
+        ],
+        20_000
+      );
+      const fields = projectFieldListSchema.parse(JSON.parse(fieldsOut)).fields;
+      const statusField = fields.find(
+        field => field.name?.trim().toLowerCase() === 'status' && field.options
+      );
+      for (const option of statusField?.options ?? []) {
+        const name = option.name.trim();
+        const identity = name.toLowerCase();
+        if (!name || seen.has(identity)) continue;
+        seen.add(identity);
+        options.push({ name, category: projectStateCategory(name) ?? 'todo' });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return options;
+}
+
+function getProjectStatusOptions(
+  runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
+  owner: string
+): Promise<ProjectStatusOption[]> {
+  const now = Date.now();
+  const cached = statusOptionsCache.get(owner);
+  if (cached && cached.expires > now) return cached.value;
+  const value = loadProjectStatusOptions(runGithubCli, owner).catch(() => {
+    statusOptionsCache.delete(owner);
+    return [] as ProjectStatusOption[];
+  });
+  statusOptionsCache.set(owner, { expires: now + STATUS_CACHE_TTL_MS, value });
+  return value;
+}
+
 function toItem(
   value: z.infer<typeof githubItemSchema>,
-  comments: ExternalWorkItemDetail['comments'] = []
+  comments: ExternalWorkItemDetail['comments'] = [],
+  projectStatus?: ProjectStatus
 ): ExternalWorkItemDetail {
   const open = value.state.toLowerCase() === 'open';
+  const category = projectStatus
+    ? projectStateCategory(projectStatus.status)
+    : null;
   return {
     source: 'github',
     locator: `${value.repo}#${value.number}`,
@@ -251,9 +503,9 @@ function toItem(
     title: value.title,
     description: value.body,
     url: value.url,
-    status: value.state,
-    stateCategory: open ? 'todo' : 'done',
-    priority: null,
+    status: projectStatus?.status ?? value.state,
+    stateCategory: category ?? (open ? 'todo' : 'done'),
+    priority: projectStatus?.priority ?? null,
     assignee: value.assignees.join(', ') || null,
     project: value.repo,
     labels: value.labels,
@@ -295,13 +547,34 @@ export function createGithubAdapter(
     if (result.issue.repo !== repo || result.issue.number !== number) {
       throw new Error(`GitHub returned the wrong issue for ${locator}`);
     }
-    return toItem({ ...result.issue, kind: 'issue' }, result.issue.comments);
+    const projectStatusMap = await getProjectStatusMap(runGithubCli, [repo]);
+    return toItem(
+      { ...result.issue, kind: 'issue' },
+      result.issue.comments,
+      projectStatusMap.get(`${repo}#${number}`)
+    );
   }
 
   async function statusOptions(
     locator: string
   ): Promise<ExternalWorkStatusOption[]> {
-    const issue = await scopedIssue(locator);
+    const { repo } = parseLocator(locator);
+    const owner = repo.split('/')[0] ?? '';
+    const [issue, projectOptions] = await Promise.all([
+      scopedIssue(locator),
+      getProjectStatusOptions(runGithubCli, owner)
+    ]);
+    // Prefer the board's real Status options so the Kanban lanes mirror the
+    // GitHub Project instead of a synthetic Open/Closed pair.
+    if (projectOptions.length > 0) {
+      const currentName = issue.status.trim().toLowerCase();
+      return projectOptions.map(option => ({
+        id: option.name,
+        name: option.name,
+        stateCategory: option.category,
+        current: option.name.toLowerCase() === currentName
+      }));
+    }
     const current = issue.status.toLowerCase() === 'open' ? 'open' : 'closed';
     return [
       {
@@ -344,25 +617,36 @@ export function createGithubAdapter(
         throw new Error(status.ghError ?? 'GitHub is not authenticated');
       }
       const repos = githubReposForProject(status, projectId);
-      const results = await Promise.all(
-        repos.map(async repo => ({
-          repo,
-          result: await bb.sdk.plugins.callRpc({
-            pluginId: 'github',
-            method: 'listItems',
-            input: { kind: 'issue', repo },
-            outputSchema: listOutputSchema
-          })
-        }))
-      );
+      const [projectStatusMap, results] = await Promise.all([
+        getProjectStatusMap(runGithubCli, repos),
+        Promise.all(
+          repos.map(async repo => ({
+            repo,
+            result: await bb.sdk.plugins.callRpc({
+              pluginId: 'github',
+              method: 'listItems',
+              input: { kind: 'issue', repo },
+              outputSchema: listOutputSchema
+            })
+          }))
+        )
+      ]);
+      // When board data is available, mirror the GitHub Project exactly: only
+      // issues placed on a board appear, so no synthetic Open/Closed lanes leak
+      // in. If the board fetch failed (empty map), fall back to every issue.
+      const boardScoped = projectStatusMap.size > 0;
       return results.flatMap(({ repo, result }) =>
-        result.items.map(item => {
+        result.items.flatMap(item => {
           if (item.repo !== repo || item.kind !== 'issue') {
             throw new Error(
               `GitHub returned an item outside requested repository ${repo}`
             );
           }
-          return withoutComments(toItem(item));
+          const projectStatus = projectStatusMap.get(
+            `${item.repo}#${item.number}`
+          );
+          if (boardScoped && !projectStatus) return [];
+          return [withoutComments(toItem(item, [], projectStatus))];
         })
       );
     },
@@ -562,6 +846,14 @@ export function createGithubAdapter(
       const target = available.find(option => option.id === statusId);
       if (!target) {
         throw new Error('GitHub status is not available for this issue');
+      }
+      // Only the synthetic Open/Closed options map to a GitHub issue-state write.
+      // Project v2 board statuses are display-only for now; changing them needs
+      // a ProjectV2 field mutation that Taskboard does not perform yet.
+      if (statusId !== 'open' && statusId !== 'closed') {
+        throw new Error(
+          'Changing a GitHub Project status from Taskboard is not supported yet — update it on GitHub.'
+        );
       }
       if (!target.current) {
         const { repo, number } = parseLocator(locator);
