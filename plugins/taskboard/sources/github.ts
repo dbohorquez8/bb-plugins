@@ -320,27 +320,7 @@ async function loadProjectStatusMap(
     ...new Set(repos.map(repo => repo.split('/')[0]).filter(Boolean))
   ];
   for (const owner of owners) {
-    let projectNumbers: number[] = [];
-    try {
-      const listOut = await runGithubCli(
-        [
-          'project',
-          'list',
-          '--owner',
-          owner,
-          '--limit',
-          '100',
-          '--format',
-          'json'
-        ],
-        20_000
-      );
-      projectNumbers = projectListSchema
-        .parse(JSON.parse(listOut))
-        .projects.map(project => project.number);
-    } catch {
-      continue;
-    }
+    const projectNumbers = await getProjectNumbers(runGithubCli, owner);
     for (const number of projectNumbers) {
       let items: z.infer<typeof projectStatusItemSchema>[] = [];
       try {
@@ -395,9 +375,12 @@ interface ProjectStatusOption {
   category: WorkStateCategory;
 }
 
-// gh project calls are slow and the Kanban preloads statuses for every visible
-// item at once, so cache per owner for a short window to collapse the fan-out.
-const STATUS_CACHE_TTL_MS = 60_000;
+// gh project calls are GraphQL under the hood and their cost is charged
+// against GitHub's 5,000 pts/hour budget before the query even runs, so we
+// cache per owner for several minutes (board structure rarely changes
+// second-to-second) to collapse the fan-out from the Kanban preloading
+// statuses for every visible item at once.
+const STATUS_CACHE_TTL_MS = 5 * 60_000;
 const statusMapCache = new Map<
   string,
   { expires: number; value: Promise<Map<string, ProjectStatus>> }
@@ -406,6 +389,34 @@ const statusOptionsCache = new Map<
   string,
   { expires: number; value: Promise<ProjectStatusOption[]> }
 >();
+// `gh project list` is itself a GraphQL call — loadProjectStatusMap and
+// loadProjectStatusOptions both need the owner's project numbers, so share
+// one cache instead of each fetching it independently.
+const projectListCache = new Map<
+  string,
+  { expires: number; value: Promise<number[]> }
+>();
+
+function getProjectNumbers(
+  runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
+  owner: string
+): Promise<number[]> {
+  const now = Date.now();
+  const cached = projectListCache.get(owner);
+  if (cached && cached.expires > now) return cached.value;
+  const value = runGithubCli(
+    ['project', 'list', '--owner', owner, '--limit', '100', '--format', 'json'],
+    20_000
+  )
+    .then(listOut =>
+      projectListSchema.parse(JSON.parse(listOut)).projects.map(
+        project => project.number
+      )
+    )
+    .catch(() => [] as number[]);
+  projectListCache.set(owner, { expires: now + STATUS_CACHE_TTL_MS, value });
+  return value;
+}
 
 function getProjectStatusMap(
   runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
@@ -426,18 +437,7 @@ async function loadProjectStatusOptions(
 ): Promise<ProjectStatusOption[]> {
   const options: ProjectStatusOption[] = [];
   const seen = new Set<string>();
-  let projectNumbers: number[] = [];
-  try {
-    const listOut = await runGithubCli(
-      ['project', 'list', '--owner', owner, '--limit', '100', '--format', 'json'],
-      20_000
-    );
-    projectNumbers = projectListSchema
-      .parse(JSON.parse(listOut))
-      .projects.map(project => project.number);
-  } catch {
-    return options;
-  }
+  const projectNumbers = await getProjectNumbers(runGithubCli, owner);
   for (const number of projectNumbers) {
     try {
       const fieldsOut = await runGithubCli(
