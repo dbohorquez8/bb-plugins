@@ -9,7 +9,7 @@ import type {
   ExternalWorkStatusOption,
   WorkSourceAdapter
 } from './types.js';
-import { withoutComments } from './types.js';
+import { TaskboardError, withoutComments } from './types.js';
 
 const LINEAR_API = 'https://api.linear.app/graphql';
 
@@ -283,7 +283,8 @@ export function createLinearAdapter(options: {
       throw new Error(`Linear returned the wrong issue for ${locator}`);
     }
     if (issue.team.key.toLowerCase() !== teamKey.toLowerCase()) {
-      throw new Error(
+      throw new TaskboardError(
+        'out_of_scope',
         `Linear issue ${locator} is outside the configured scope`
       );
     }
@@ -317,7 +318,8 @@ export function createLinearAdapter(options: {
       throw new Error(`Linear returned the wrong issue for ${locator}`);
     }
     if (result.team.key.toLowerCase() !== teamKey.toLowerCase()) {
-      throw new Error(
+      throw new TaskboardError(
+        'out_of_scope',
         `Linear issue ${locator} is outside the configured scope`
       );
     }
@@ -616,7 +618,10 @@ export function createLinearAdapter(options: {
       const available = await statusOptions(locator);
       const target = available.find(option => option.id === statusId);
       if (!target) {
-        throw new Error('Linear status is not available for this issue');
+        throw new TaskboardError(
+          'unsupported_transition',
+          'Linear status is not available for this issue'
+        );
       }
       if (target.current) return loadIssue(locator);
       const data = await requestLinear(apiKey, updateIssueStatusMutation, {

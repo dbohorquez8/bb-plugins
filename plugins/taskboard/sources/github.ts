@@ -11,7 +11,7 @@ import type {
   ExternalWorkStatusOption,
   WorkSourceAdapter
 } from './types.js';
-import { withoutComments } from './types.js';
+import { TaskboardError, withoutComments } from './types.js';
 
 const githubItemSchema = z
   .object({
@@ -248,6 +248,7 @@ export function githubReposForProject(
 // Project v2 Status field directly via the gh CLI and map it onto the item.
 const projectStatusItemSchema = z
   .object({
+    id: z.string().optional(),
     content: z
       .object({
         type: z.string().optional(),
@@ -257,8 +258,12 @@ const projectStatusItemSchema = z
       .passthrough()
       .optional(),
     repository: z.string().optional(),
-    status: z.string().optional(),
-    priority: z.string().optional()
+    // `gh project item-list` emits `null` (not merely absent) for an unset
+    // Status/Priority field — `.optional()` alone rejects that with a Zod
+    // parse error, which the caller's catch then swallows as a fetch
+    // failure, silently dropping every affected item from the map.
+    status: z.string().nullish(),
+    priority: z.string().nullish()
   })
   .passthrough();
 
@@ -267,7 +272,7 @@ const projectItemListSchema = z
   .passthrough();
 
 const projectListEntrySchema = z
-  .object({ number: z.number().int() })
+  .object({ number: z.number().int(), id: z.string().optional() })
   .passthrough();
 
 const projectListSchema = z
@@ -277,6 +282,12 @@ const projectListSchema = z
 interface ProjectStatus {
   status: string;
   priority: string | null;
+  // Which of the owner's boards this issue actually sits on, and the item's
+  // own node id on that board — both needed to write a real status change,
+  // since option names are deduped across an owner's projects for display
+  // (see ProjectStatusOption) and are otherwise ambiguous.
+  projectNumber: number;
+  itemId: string;
 }
 
 function projectStateCategory(name: string): WorkStateCategory | null {
@@ -323,8 +334,8 @@ async function loadProjectStatusMap(
     ...new Set(repos.map(repo => repo.split('/')[0]).filter(Boolean))
   ];
   for (const owner of owners) {
-    const projectNumbers = await getProjectNumbers(runGithubCli, owner);
-    for (const number of projectNumbers) {
+    const projects = await getProjects(runGithubCli, owner);
+    for (const { number } of projects) {
       let items: z.infer<typeof projectStatusItemSchema>[] = [];
       try {
         const itemsOut = await runGithubCli(
@@ -348,13 +359,18 @@ async function loadProjectStatusMap(
       }
       for (const item of items) {
         const status = item.status?.trim();
-        if (!status) continue;
+        if (!status || !item.id) continue;
         const repo = item.content?.repository ?? item.repository;
         const num = item.content?.number;
         if (!repo || typeof num !== 'number' || !repoSet.has(repo)) continue;
         const key = `${repo}#${num}`;
         if (map.has(key)) continue;
-        map.set(key, { status, priority: item.priority?.trim() || null });
+        map.set(key, {
+          status,
+          priority: item.priority?.trim() || null,
+          projectNumber: number,
+          itemId: item.id
+        });
       }
     }
   }
@@ -364,9 +380,14 @@ async function loadProjectStatusMap(
 // Status field option metadata from a Project v2 board.
 const projectFieldSchema = z
   .object({
+    id: z.string().optional(),
     name: z.string().optional(),
     type: z.string().optional(),
-    options: z.array(z.object({ name: z.string() }).passthrough()).optional()
+    options: z
+      .array(
+        z.object({ id: z.string().optional(), name: z.string() }).passthrough()
+      )
+      .optional()
   })
   .passthrough();
 
@@ -378,6 +399,23 @@ interface ProjectStatusOption {
   name: string;
   category: WorkStateCategory;
 }
+
+// The GraphQL ids a real Status-field write needs, per project board. Not
+// deduped across an owner's projects the way ProjectStatusOption is — a
+// write always targets one specific board, resolved via ProjectStatus's
+// projectNumber, never by option name alone (two boards can reuse a name
+// like "In Progress" with different option ids).
+interface ProjectFieldInfo {
+  projectNodeId: string;
+  fieldId: string;
+  optionIdByName: Map<string, string>;
+}
+
+// Keyed by `${owner}/${projectNumber}`. Populated as a side effect of
+// loadProjectStatusOptions, which already fetches `project field-list` for
+// every board it lists options for — no extra GraphQL call to keep this
+// warm.
+const projectFieldInfoCache = new Map<string, ProjectFieldInfo>();
 
 // gh project calls are GraphQL under the hood and their cost is charged
 // against GitHub's 5,000 pts/hour budget before the query even runs, so we
@@ -398,18 +436,25 @@ const statusOptionsCache = new Map<
   string,
   { expires: number; value: Promise<ProjectStatusOption[]> }
 >();
+interface ProjectListEntry {
+  number: number;
+  // Absent on gh CLI versions that don't emit it for `project list`; a board
+  // whose node id we never learned can be read but never written to.
+  id: string | null;
+}
+
 // `gh project list` is itself a GraphQL call — loadProjectStatusMap and
 // loadProjectStatusOptions both need the owner's project numbers, so share
 // one cache instead of each fetching it independently.
 const projectListCache = new Map<
   string,
-  { expires: number; value: Promise<number[]> }
+  { expires: number; value: Promise<ProjectListEntry[]> }
 >();
 
-function getProjectNumbers(
+function getProjects(
   runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
   owner: string
-): Promise<number[]> {
+): Promise<ProjectListEntry[]> {
   const now = Date.now();
   const cached = projectListCache.get(owner);
   if (cached && cached.expires > now) return cached.value;
@@ -417,11 +462,12 @@ function getProjectNumbers(
     ['project', 'list', '--owner', owner, '--limit', '100', '--format', 'json'],
     20_000
   ).then(listOut =>
-    projectListSchema.parse(JSON.parse(listOut)).projects.map(
-      project => project.number
-    )
+    projectListSchema.parse(JSON.parse(listOut)).projects.map(project => ({
+      number: project.number,
+      id: project.id ?? null
+    }))
   );
-  const value = raw.catch(() => [] as number[]);
+  const value = raw.catch(() => [] as ProjectListEntry[]);
   projectListCache.set(owner, { expires: now + STATUS_CACHE_TTL_MS, value });
   raw.catch(() => {
     const entry = projectListCache.get(owner);
@@ -466,14 +512,14 @@ async function loadProjectStatusOptions(
   const options: ProjectStatusOption[] = [];
   const seen = new Set<string>();
   let hadFailure = false;
-  const projectNumbers = await getProjectNumbers(runGithubCli, owner);
-  for (const number of projectNumbers) {
+  const projects = await getProjects(runGithubCli, owner);
+  for (const project of projects) {
     try {
       const fieldsOut = await runGithubCli(
         [
           'project',
           'field-list',
-          String(number),
+          String(project.number),
           '--owner',
           owner,
           '--limit',
@@ -487,6 +533,17 @@ async function loadProjectStatusOptions(
       const statusField = fields.find(
         field => field.name?.trim().toLowerCase() === 'status' && field.options
       );
+      if (statusField?.id && project.id) {
+        const optionIdByName = new Map<string, string>();
+        for (const option of statusField.options ?? []) {
+          if (option.id) optionIdByName.set(option.name.trim().toLowerCase(), option.id);
+        }
+        projectFieldInfoCache.set(`${owner}/${project.number}`, {
+          projectNodeId: project.id,
+          fieldId: statusField.id,
+          optionIdByName
+        });
+      }
       for (const option of statusField?.options ?? []) {
         const name = option.name.trim();
         const identity = name.toLowerCase();
@@ -575,7 +632,8 @@ export function createGithubAdapter(
       throw new Error(status.ghError ?? 'GitHub is not authenticated');
     }
     if (!githubReposForProject(status, projectId).includes(repo)) {
-      throw new Error(
+      throw new TaskboardError(
+        'out_of_scope',
         `GitHub repository ${repo} is not mapped to BB project ${projectId}`
       );
     }
@@ -886,25 +944,75 @@ export function createGithubAdapter(
       const available = await statusOptions(locator);
       const target = available.find(option => option.id === statusId);
       if (!target) {
-        throw new Error('GitHub status is not available for this issue');
-      }
-      // Only the synthetic Open/Closed options map to a GitHub issue-state write.
-      // Project v2 board statuses are display-only for now; changing them needs
-      // a ProjectV2 field mutation that Taskboard does not perform yet.
-      if (statusId !== 'open' && statusId !== 'closed') {
-        throw new Error(
-          'Changing a GitHub Project status from Taskboard is not supported yet — update it on GitHub.'
+        throw new TaskboardError(
+          'unsupported_transition',
+          'GitHub status is not available for this issue'
         );
       }
-      if (!target.current) {
-        const { repo, number } = parseLocator(locator);
+      if (target.current) return scopedIssue(locator);
+      const { repo, number } = parseLocator(locator);
+      if (statusId === 'open' || statusId === 'closed') {
         await bb.sdk.plugins.callRpc({
           pluginId: 'github',
           method: 'setIssueState',
           input: { repo, number, state: statusId },
           outputSchema: okOutputSchema
         });
+        return scopedIssue(locator);
       }
+      // A real board-column move: resolve which of the owner's boards this
+      // issue is actually on (never by option name alone — two boards can
+      // reuse a name like "In Progress" with different option ids), then
+      // write the Status single-select field via that board's own ids.
+      const owner = repo.split('/')[0] ?? '';
+      const projectStatusMap = await getProjectStatusMap(runGithubCli, [repo]);
+      const current = projectStatusMap.get(`${repo}#${number}`);
+      if (!current) {
+        throw new TaskboardError(
+          'not_on_board',
+          `${locator} is not on any GitHub Project board`
+        );
+      }
+      const fieldInfo = projectFieldInfoCache.get(
+        `${owner}/${current.projectNumber}`
+      );
+      if (!fieldInfo) {
+        throw new TaskboardError(
+          'not_cached',
+          'GitHub Project board field metadata is not loaded yet; try again'
+        );
+      }
+      const optionId = fieldInfo.optionIdByName.get(statusId.toLowerCase());
+      if (!optionId) {
+        throw new TaskboardError(
+          'unsupported_transition',
+          `GitHub Project board has no "${statusId}" status option`
+        );
+      }
+      await runGithubCli(
+        [
+          'project',
+          'item-edit',
+          '--id',
+          current.itemId,
+          '--project-id',
+          fieldInfo.projectNodeId,
+          '--field-id',
+          fieldInfo.fieldId,
+          '--single-select-option-id',
+          optionId
+        ],
+        20_000
+      );
+      // Patch the shared cache in place rather than invalidating it: the
+      // status map is cached up to STATUS_CACHE_TTL_MS (5 min), and without
+      // this the write would succeed while every reader — including the
+      // scopedIssue() call below — kept serving the pre-write status until
+      // the cache expired.
+      projectStatusMap.set(`${repo}#${number}`, {
+        ...current,
+        status: target.name
+      });
       return scopedIssue(locator);
     }
   };

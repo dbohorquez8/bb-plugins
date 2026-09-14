@@ -57,6 +57,7 @@ import { createJiraAdapter } from './sources/jira.js';
 import { jiraProjectKeysFromJql } from './sources/jira-scope.js';
 import { createLinearAdapter } from './sources/linear.js';
 import {
+  TaskboardError,
   withoutComments,
   type ExternalWorkItemCreateResult,
   type ExternalWorkItem,
@@ -1345,7 +1346,8 @@ export default async function plugin(bb: BbPluginApi) {
     await waitForMutations(projectId, [source]);
     assertSelectedSource(projectId, source);
     if (!store.get(projectId, source, locator)) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_cached',
         `${sourceName(source)} item is not cached for this BB project; refresh the project tracker first`
       );
     }
@@ -1361,7 +1363,8 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     if (!adapter.configured()) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_configured',
         adapter.configurationMessage() ??
           `${sourceName(source)} is not configured`
       );
@@ -1369,8 +1372,10 @@ export default async function plugin(bb: BbPluginApi) {
     let externalItem: ExternalWorkItemDetail;
     try {
       externalItem = await adapter.get(locator);
-    } catch {
-      throw new Error(
+    } catch (error) {
+      if (error instanceof TaskboardError) throw error;
+      throw new TaskboardError(
+        'upstream_failed',
         `${sourceName(source)} could not load the requested item`
       );
     }
@@ -1391,7 +1396,8 @@ export default async function plugin(bb: BbPluginApi) {
     await waitForMutations(projectId, [source]);
     assertSelectedSource(projectId, source);
     if (!store.get(projectId, source, locator)) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_cached',
         `${sourceName(source)} item is not cached for this BB project; refresh the project tracker first`
       );
     }
@@ -1407,7 +1413,8 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     if (!adapter.configured()) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_configured',
         adapter.configurationMessage() ??
           `${sourceName(source)} is not configured`
       );
@@ -1418,11 +1425,10 @@ export default async function plugin(bb: BbPluginApi) {
         .array()
         .parse(await adapter.statusOptions(locator));
     } catch (error) {
-      const message = errorMessage(error);
-      throw new Error(
-        message.includes('outside the configured scope')
-          ? message
-          : `${sourceName(source)} could not load valid statuses for this item`
+      if (error instanceof TaskboardError) throw error;
+      throw new TaskboardError(
+        'upstream_failed',
+        `${sourceName(source)} could not load valid statuses for this item`
       );
     }
     if (currentRevision(projectId, source) !== revision) {
@@ -1452,7 +1458,8 @@ export default async function plugin(bb: BbPluginApi) {
     assertSelectedSource(projectId, source);
     const cached = store.get(projectId, source, locator);
     if (!cached) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_cached',
         `${sourceName(source)} item is not cached for this BB project; refresh the project tracker first`
       );
     }
@@ -1463,7 +1470,8 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Missing ${source} adapter`);
     }
     if (!adapter.configured()) {
-      throw new Error(
+      throw new TaskboardError(
+        'not_configured',
         adapter.configurationMessage() ??
           `${sourceName(source)} is not configured`
       );
@@ -1475,7 +1483,8 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
       if (!store.get(projectId, source, locator)) {
-        throw new Error(
+        throw new TaskboardError(
+          'not_cached',
           `${sourceName(source)} item is no longer cached for this BB project`
         );
       }
@@ -1484,12 +1493,10 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         externalItem = await adapter.updateStatus(locator, statusId);
       } catch (error) {
-        const message = errorMessage(error);
-        throw new Error(
-          message.includes('not available') ||
-            message.includes('outside the configured scope')
-            ? message
-            : `${sourceName(source)} could not update this item status`
+        if (error instanceof TaskboardError) throw error;
+        throw new TaskboardError(
+          'upstream_failed',
+          `${sourceName(source)} could not update this item status`
         );
       }
       if (externalItem.source !== source || externalItem.locator !== locator) {
@@ -1513,6 +1520,27 @@ export default async function plugin(bb: BbPluginApi) {
         );
       });
     return mutation;
+  }
+
+  // CLI-only convenience: a human or agent running `bb taskboard show`/`move`
+  // straight after `bb taskboard config` (or before ever calling `list`) hits
+  // `not_cached` even though the item genuinely exists upstream — the store
+  // just hasn't synced yet. Refresh once and retry rather than making the
+  // caller re-run the command by hand.
+  async function withNotCachedRetry<T>(
+    projectId: string,
+    source: WorkSource,
+    action: () => Promise<T>
+  ): Promise<T> {
+    try {
+      return await action();
+    } catch (error) {
+      if (!(error instanceof TaskboardError) || error.code !== 'not_cached') {
+        throw error;
+      }
+      await syncAll(projectId, source, true);
+      return action();
+    }
   }
 
   async function createWorkItem(
@@ -2018,10 +2046,10 @@ export default async function plugin(bb: BbPluginApi) {
           if (!parsedSource.success) {
             throw new Error('Source must be linear, github, or jira');
           }
-          const item = await getLiveItem(
+          const item = await withNotCachedRetry(
             project.id,
             parsedSource.data,
-            locator
+            () => getLiveItem(project.id, parsedSource.data, locator)
           );
           return {
             exitCode: 0,
@@ -2081,11 +2109,17 @@ export default async function plugin(bb: BbPluginApi) {
           if (!parsedSource.success) {
             throw new Error('Source must be linear, github, or jira');
           }
-          const item = await updateItemStatus(
+          const statusId = args.statusId;
+          const item = await withNotCachedRetry(
             project.id,
             parsedSource.data,
-            args.positionals[1]!,
-            args.statusId
+            () =>
+              updateItemStatus(
+                project.id,
+                parsedSource.data,
+                args.positionals[1]!,
+                statusId
+              )
           );
           return {
             exitCode: 0,

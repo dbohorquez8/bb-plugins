@@ -11,7 +11,7 @@ import type {
   ExternalWorkStatusOption,
   WorkSourceAdapter
 } from './types.js';
-import { withoutComments } from './types.js';
+import { TaskboardError, withoutComments } from './types.js';
 import { jiraProjectKeysFromJql } from './jira-scope.js';
 
 const jiraIssueSchema = z
@@ -360,7 +360,10 @@ export function createJiraAdapter(options: {
       throw new Error('Jira could not verify the configured scope');
     }
     if (!match.matchedIssues.includes(issueId)) {
-      throw new Error(`Jira issue ${locator} is outside the configured scope`);
+      throw new TaskboardError(
+        'out_of_scope',
+        `Jira issue ${locator} is outside the configured scope`
+      );
     }
     return issue;
   }
@@ -696,7 +699,10 @@ export function createJiraAdapter(options: {
       const available = await transitionOptions(locator);
       const target = available.options.find(option => option.id === statusId);
       if (!target) {
-        throw new Error('Jira status is not available for this issue');
+        throw new TaskboardError(
+          'unsupported_transition',
+          'Jira status is not available for this issue'
+        );
       }
       if (!target.current) {
         if (!target.transitionId) {
