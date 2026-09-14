@@ -108,6 +108,11 @@ gh auth login
 bb plugin reload github
 ```
 
+Board columns from a repository's GitHub Projects (v2) surface as the item's
+status. Moving an item (drag, status pill, or `bb taskboard move`) writes the
+board's real Status field through the `gh` CLI — not just issue open/closed —
+so the change shows up on GitHub's own board immediately.
+
 ### Linear
 
 Choose Linear in **Manage**, then provide the project's Linear personal API key
