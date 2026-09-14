@@ -309,12 +309,15 @@ function projectStateCategory(name: string): WorkStateCategory | null {
 }
 
 // One map covering every issue on any of the owner's project boards, keyed by
-// "owner/repo#number". Best-effort: any gh failure degrades to open/closed.
+// "owner/repo#number". Best-effort: any gh failure degrades to open/closed —
+// callers use `hadFailure` to avoid caching that degraded state as if it were
+// a real "this repo has no board" result.
 async function loadProjectStatusMap(
   runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
   repos: readonly string[]
-): Promise<Map<string, ProjectStatus>> {
+): Promise<{ map: Map<string, ProjectStatus>; hadFailure: boolean }> {
   const map = new Map<string, ProjectStatus>();
+  let hadFailure = false;
   const repoSet = new Set(repos);
   const owners = [
     ...new Set(repos.map(repo => repo.split('/')[0]).filter(Boolean))
@@ -340,6 +343,7 @@ async function loadProjectStatusMap(
         );
         items = projectItemListSchema.parse(JSON.parse(itemsOut)).items;
       } catch {
+        hadFailure = true;
         continue;
       }
       for (const item of items) {
@@ -354,7 +358,7 @@ async function loadProjectStatusMap(
       }
     }
   }
-  return map;
+  return { map, hadFailure };
 }
 
 // Status field option metadata from a Project v2 board.
@@ -381,6 +385,11 @@ interface ProjectStatusOption {
 // second-to-second) to collapse the fan-out from the Kanban preloading
 // statuses for every visible item at once.
 const STATUS_CACHE_TTL_MS = 5 * 60_000;
+// A failed fetch (rate limit, timeout, transient gh error) must not be
+// remembered as "this owner/repo has no board" for the full TTL — that's what
+// strands the Kanban on the synthetic Open/Closed fallback for minutes at a
+// time. Failures get this much shorter window so the next view retries soon.
+const FAILURE_CACHE_TTL_MS = 10_000;
 const statusMapCache = new Map<
   string,
   { expires: number; value: Promise<Map<string, ProjectStatus>> }
@@ -404,17 +413,25 @@ function getProjectNumbers(
   const now = Date.now();
   const cached = projectListCache.get(owner);
   if (cached && cached.expires > now) return cached.value;
-  const value = runGithubCli(
+  const raw = runGithubCli(
     ['project', 'list', '--owner', owner, '--limit', '100', '--format', 'json'],
     20_000
-  )
-    .then(listOut =>
-      projectListSchema.parse(JSON.parse(listOut)).projects.map(
-        project => project.number
-      )
+  ).then(listOut =>
+    projectListSchema.parse(JSON.parse(listOut)).projects.map(
+      project => project.number
     )
-    .catch(() => [] as number[]);
+  );
+  const value = raw.catch(() => [] as number[]);
   projectListCache.set(owner, { expires: now + STATUS_CACHE_TTL_MS, value });
+  raw.catch(() => {
+    const entry = projectListCache.get(owner);
+    if (entry && entry.value === value) {
+      projectListCache.set(owner, {
+        expires: Date.now() + FAILURE_CACHE_TTL_MS,
+        value
+      });
+    }
+  });
   return value;
 }
 
@@ -426,17 +443,29 @@ function getProjectStatusMap(
   const now = Date.now();
   const cached = statusMapCache.get(key);
   if (cached && cached.expires > now) return cached.value;
-  const value = loadProjectStatusMap(runGithubCli, repos);
+  const loaded = loadProjectStatusMap(runGithubCli, repos);
+  const value = loaded.then(result => result.map);
   statusMapCache.set(key, { expires: now + STATUS_CACHE_TTL_MS, value });
+  loaded.then(result => {
+    if (!result.hadFailure) return;
+    const entry = statusMapCache.get(key);
+    if (entry && entry.value === value) {
+      statusMapCache.set(key, {
+        expires: Date.now() + FAILURE_CACHE_TTL_MS,
+        value
+      });
+    }
+  });
   return value;
 }
 
 async function loadProjectStatusOptions(
   runGithubCli: (args: string[], timeoutMs?: number) => Promise<string>,
   owner: string
-): Promise<ProjectStatusOption[]> {
+): Promise<{ options: ProjectStatusOption[]; hadFailure: boolean }> {
   const options: ProjectStatusOption[] = [];
   const seen = new Set<string>();
+  let hadFailure = false;
   const projectNumbers = await getProjectNumbers(runGithubCli, owner);
   for (const number of projectNumbers) {
     try {
@@ -466,10 +495,11 @@ async function loadProjectStatusOptions(
         options.push({ name, category: projectStateCategory(name) ?? 'todo' });
       }
     } catch {
+      hadFailure = true;
       continue;
     }
   }
-  return options;
+  return { options, hadFailure };
 }
 
 function getProjectStatusOptions(
@@ -479,11 +509,22 @@ function getProjectStatusOptions(
   const now = Date.now();
   const cached = statusOptionsCache.get(owner);
   if (cached && cached.expires > now) return cached.value;
-  const value = loadProjectStatusOptions(runGithubCli, owner).catch(() => {
-    statusOptionsCache.delete(owner);
-    return [] as ProjectStatusOption[];
-  });
+  const loaded = loadProjectStatusOptions(runGithubCli, owner).catch(() => ({
+    options: [] as ProjectStatusOption[],
+    hadFailure: true
+  }));
+  const value = loaded.then(result => result.options);
   statusOptionsCache.set(owner, { expires: now + STATUS_CACHE_TTL_MS, value });
+  loaded.then(result => {
+    if (!result.hadFailure) return;
+    const entry = statusOptionsCache.get(owner);
+    if (entry && entry.value === value) {
+      statusOptionsCache.set(owner, {
+        expires: Date.now() + FAILURE_CACHE_TTL_MS,
+        value
+      });
+    }
+  });
   return value;
 }
 
