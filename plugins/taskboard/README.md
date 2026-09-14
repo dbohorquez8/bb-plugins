@@ -209,6 +209,72 @@ all of its facets through the same filtering rules as the board; explicit
 An explicit source must match the tracker selected for that project. Taskboard
 rejects mismatches before contacting a provider.
 
+CLI failures carry a stable `code` alongside the message so scripts can branch
+on outcome instead of matching text: `not_cached`, `not_configured`,
+`unsupported_transition`, `not_on_board`, `out_of_scope`, `upstream_failed`.
+With `--json`, a failing command prints `{ ok: false, code, message }` on
+stdout and exits non-zero; without `--json` it prints the message to stderr.
+`show` and `move` also retry once on `not_cached` (refreshing the project's
+cache first) before failing, so a CLI caller doesn't need its own retry logic
+for that case.
+
+## Driving the board from a workflow
+
+Any external automation — a CI step, a git hook, an agentic coding workflow —
+can move a tracked item's status the same way a person dragging a Kanban card
+does, by shelling out to `bb taskboard move`. This project doesn't hardcode
+which workflow calls it; the pattern below shows one project-owned hook that
+translates a workflow's events into board moves, so the workflow tool itself
+never needs to know GitHub, Linear, or Jira exist.
+
+A hook file like `.ddd/hooks/tracker-status.sh`, sourced by the workflow at a
+few well-defined points (e.g. "work started," "PR opened"), can look like
+this:
+
+```bash
+# .ddd/hooks/tracker-status.sh — sourced by the calling workflow
+# In scope: DDD_EVENT DDD_FEATURE_DIR DDD_FEATURE_NAME DDD_BRANCH DDD_TICKET DDD_PR_URL
+[ -n "$DDD_TICKET" ] || { echo "tracker_status=skipped"; echo "tracker_message=no TICKET in feature.conf"; return 0; }
+
+source="${DDD_TICKET%%:*}"          # github | linear | jira
+locator="${DDD_TICKET#*:}"          # owner/repo#123 | ENG-42 | PROJ-7
+case "$DDD_EVENT" in
+  dispatch.started) status="In Progress" ;;
+  push.pr_opened)   status="In Review" ;;
+  *)                echo "tracker_status=skipped"; return 0 ;;
+esac
+
+BB="${BB_CLI:-bb}"
+proj=(); [ -n "${BB_PROJECT_ID:-}" ] && proj=(--project "$BB_PROJECT_ID")
+out=$("$BB" plugin run taskboard move "$source" "$locator" --status "$status" "${proj[@]}" --json 2>&1)
+rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'not cached'; then
+  "$BB" plugin run taskboard refresh "$source" "${proj[@]}" >/dev/null 2>&1
+  out=$("$BB" plugin run taskboard move "$source" "$locator" --status "$status" "${proj[@]}" --json 2>&1); rc=$?
+fi
+if [ $rc -ne 0 ]; then
+  if printf '%s' "$out" | grep -qi 'unsupported\|not supported\|not available'; then
+    echo "tracker_status=rejected"
+  else
+    echo "tracker_status=failed"
+  fi
+  echo "tracker_message=$(printf '%s' "$out" | tail -n 1)"
+  return 1
+fi
+```
+
+Notes on that body:
+
+- `bb plugin run taskboard …` is used rather than `bb taskboard …` because the
+  explicit form stays available even if BB core later claims the `taskboard`
+  name.
+- `--project "$BB_PROJECT_ID"` is passed explicitly even from inside a BB
+  thread, since the SDK marks the forwarded project id optional ("when
+  known").
+- The plain-text `not cached` / `unsupported` matching above is a
+  backward-compatible fallback; a caller that already parses `--json` output
+  should match on the structured `code` field instead (see above).
+
 ## Credentials and privacy
 
 Linear and Jira credentials are isolated by BB project. Secret inputs are
