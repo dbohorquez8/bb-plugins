@@ -1873,6 +1873,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
     ],
     async run(argv, ctx) {
+      // Set once args parses successfully; the catch block below needs it to
+      // decide whether a thrown TaskboardError should render as structured
+      // JSON, but `args` itself is out of scope there (declared inside the
+      // try block).
+      let jsonRequested = false;
       try {
         const firstArgument = argv[0];
         const hasExplicitCommand = Boolean(
@@ -1883,6 +1888,7 @@ export default async function plugin(bb: BbPluginApi) {
           command,
           hasExplicitCommand ? argv.slice(1) : argv
         );
+        jsonRequested = args.json;
         const requireProject = async (): Promise<TrackerProject> => {
           const parsedProject = bbProjectIdSchema.safeParse(
             args.projectId ?? ctx.projectId
@@ -2342,6 +2348,16 @@ export default async function plugin(bb: BbPluginApi) {
         }
         throw new Error('Unknown bb taskboard command');
       } catch (error) {
+        if (jsonRequested && error instanceof TaskboardError) {
+          return {
+            exitCode: 1,
+            stdout: JSON.stringify(
+              { ok: false, code: error.code, message: error.message },
+              null,
+              2
+            )
+          };
+        }
         return { exitCode: 1, stderr: `${errorMessage(error)}\n` };
       }
     }
