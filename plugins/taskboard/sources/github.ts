@@ -162,7 +162,74 @@ async function resolveGhPath(): Promise<string> {
   throw new Error('GitHub CLI is not available');
 }
 
+// `gh project ...` is GraphQL and shares GitHub's secondary rate-limit budget
+// (max 100 concurrent, <=2,000 points/min, pause >=1s between mutations) —
+// see PromptLab's .ddd/bin/gh-board.sh for the practices this mirrors. This
+// process is one of potentially several independent callers of that budget,
+// so every `gh project` call (read or write) is serialized through one queue
+// and spaced >=1s apart, and a secondary-limit response is retried with
+// backoff instead of hammered.
+const GH_PROJECT_MIN_SPACING_MS = 1_000;
+const GH_PROJECT_MAX_ATTEMPTS = 4;
+let ghProjectQueue: Promise<void> = Promise.resolve();
+let ghProjectLastCallAt = 0;
+
+function isSecondaryRateLimitError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /secondary rate limit|was submitted too quickly|abuse detection|rate limit exceeded|\b403\b/i.test(
+    message
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForGhProjectTurn(): Promise<void> {
+  const wait = GH_PROJECT_MIN_SPACING_MS - (Date.now() - ghProjectLastCallAt);
+  if (wait > 0) await sleep(wait);
+  ghProjectLastCallAt = Date.now();
+}
+
+async function runGhProjectOnce(
+  args: string[],
+  timeoutMs: number | undefined,
+  attempt: number
+): Promise<string> {
+  try {
+    return await runFile(await resolveGhPath(), args, timeoutMs);
+  } catch (error) {
+    if (attempt >= GH_PROJECT_MAX_ATTEMPTS || !isSecondaryRateLimitError(error)) {
+      throw error;
+    }
+    await sleep(2 ** attempt * 1_000);
+    await waitForGhProjectTurn();
+    return runGhProjectOnce(args, timeoutMs, attempt + 1);
+  }
+}
+
+async function runGhProjectPaced(
+  args: string[],
+  timeoutMs?: number
+): Promise<string> {
+  const run = async (): Promise<string> => {
+    await waitForGhProjectTurn();
+    return runGhProjectOnce(args, timeoutMs, 1);
+  };
+  // Chain onto the shared queue so every `gh project` call across concurrent
+  // requests takes its spacing turn in order; the queue advances regardless
+  // of whether this call succeeds, so one caller's retries never block
+  // another caller from taking its turn.
+  const scheduled = ghProjectQueue.then(run, run);
+  ghProjectQueue = scheduled.then(
+    () => undefined,
+    () => undefined
+  );
+  return scheduled;
+}
+
 async function runGh(args: string[], timeoutMs?: number): Promise<string> {
+  if (args[0] === 'project') return runGhProjectPaced(args, timeoutMs);
   return runFile(await resolveGhPath(), args, timeoutMs);
 }
 
