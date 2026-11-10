@@ -39,7 +39,7 @@
     "@types/react-dom": "^19.0.0",
     "better-sqlite3": "^12.0.0",
     "cron-parser": "^5.5.0",
-    "hono": "^4.11.9",
+    "hono": "^4.13.17",
     "jsdom": "^26.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
@@ -61,6 +61,6 @@
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
     "vaul": "^1.1.2",
-    "vitest": "^3.2.4"
+    "vitest": "^5.1.0"
   }
 }

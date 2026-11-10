@@ -88,7 +88,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cron-parser": "^5.5.0",
-    "hono": "^4.11.9",
+    "hono": "^4.13.17",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
     "tsx": "^4.23.12",
